@@ -1186,3 +1186,114 @@ doc_comment::doctest!(
     "../../../docs/source/contributor-guide/api-health.md",
     contributor_guide_api_health
 );
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::util::pretty::print_batches;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_catalog::memory::DataSourceExec;
+    use datafusion_datasource::{
+        as_file_source, file_format::FileFormat, file_scan_config::FileScanConfigBuilder,
+        file_stream::FileStream, PartitionedFile,
+    };
+    use datafusion_datasource_parquet::{source::ParquetSource, ParquetFormat};
+    use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_physical_plan::{
+        execute_stream,
+        metrics::{self, ExecutionPlanMetricsSet},
+    };
+    use futures::{StreamExt, TryStreamExt};
+    use parquet::{
+        arrow::{
+            async_reader::ParquetRecordBatchStream, ParquetRecordBatchStreamBuilder,
+        },
+        errors::ParquetError,
+    };
+
+    use crate::prelude::{ParquetReadOptions, SessionContext};
+
+    #[tokio::test]
+    async fn arrow_xxxxxxxxxxxxxxx() {
+        let file = tokio::fs::File::open("/home/mag1cian/Projects/wrong.parquet")
+            .await
+            .unwrap();
+        let s = ParquetRecordBatchStreamBuilder::new(file)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let res = s.try_collect::<Vec<_>>().await.unwrap();
+        print_batches(&res).unwrap();
+
+        for batch in res {
+            println!("Batch: {:?}", batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxjjtest() {
+        let ctx = SessionContext::new();
+        // let df = ctx
+        //     .read_parquet(
+        //         "/home/mag1cian/Projects/wrong.parquet",
+        //         ParquetReadOptions::default(),
+        //     )
+        //     .await
+        //     .unwrap();
+        // df.show().await.unwrap()
+        let schema = schema();
+        let source = as_file_source(ParquetSource::default()).with_batch_size(8192);
+        let sc = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            schema,
+            source,
+        )
+        .with_file(
+            PartitionedFile::from_path(
+                "/home/mag1cian/Projects/wrong.parquet".to_string(),
+            )
+            .unwrap(),
+        )
+        .build();
+        let metrics = ExecutionPlanMetricsSet::new();
+        let os = ctx
+            .runtime_env()
+            .object_store(&sc.object_store_url)
+            .unwrap();
+        let opener = sc.file_source().create_file_opener(os, &sc, 0);
+        let mut s = FileStream::new(&sc, 0, opener, &metrics).unwrap();
+
+        // let exec = DataSourceExec::from_data_source(sc);
+        // let mut s = execute_stream(exec, ctx.task_ctx()).unwrap();
+        while let Some(Ok(batch)) = s.next().await {
+            print_batches(&[batch]).unwrap();
+        }
+    }
+
+    fn schema() -> Arc<Schema> {
+        // 1. 构造最内层的字段 d 和 e (在 c 里面)
+        let field_d = Field::new("d", DataType::Utf8, true);
+        let field_e = Field::new("e", DataType::Utf8, true);
+
+        // 2. 构造字段 c (Struct 类型，包含 d 和 e)
+        let field_c =
+            Field::new("c", DataType::Struct(vec![field_d, field_e].into()), true);
+
+        // 3. 构造与 c 同级的字段 g
+        let field_g = Field::new("g", DataType::Int64, true);
+
+        // 4. 构造字段 a (Struct 类型，包含 c 和 g)
+        let field_a =
+            Field::new("a", DataType::Struct(vec![field_c, field_g].into()), true);
+
+        // 5. 构造根层级的字段 z
+        let field_z = Field::new("z", DataType::Int64, true);
+
+        // 6. 组装成最终的 Schema
+        let schema = Schema::new(vec![field_a, field_z]);
+
+        return Arc::new(schema);
+    }
+}
