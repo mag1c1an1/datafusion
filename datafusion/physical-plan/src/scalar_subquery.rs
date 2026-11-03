@@ -28,7 +28,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{Result, ScalarValue, Statistics, exec_err, internal_err};
+use datafusion_common::{DataFusionError, Result, ScalarValue, Statistics, internal_err};
 use datafusion_execution::TaskContext;
 use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_physical_expr::PhysicalExpr;
@@ -44,6 +44,22 @@ use crate::{
 
 use futures::StreamExt;
 use futures::TryStreamExt;
+
+/// Error raised when an uncorrelated scalar subquery produces more than one
+/// row.
+///
+/// This is a typed error so protocol layers can map it to the PostgreSQL
+/// `cardinality_violation` SQLSTATE without matching error message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarSubqueryCardinalityError;
+
+impl fmt::Display for ScalarSubqueryCardinalityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Scalar subquery returned more than one row")
+    }
+}
+
+impl std::error::Error for ScalarSubqueryCardinalityError {}
 
 /// Links a scalar subquery's execution plan to its index in the shared results
 /// container. The [`ScalarSubqueryExec`] that owns these links populates
@@ -393,7 +409,9 @@ async fn execute_scalar_subquery(
             continue;
         }
         if result.is_some() || batch.num_rows() > 1 {
-            return exec_err!("Scalar subquery returned more than one row");
+            return Err(DataFusionError::External(Box::new(
+                ScalarSubqueryCardinalityError,
+            )));
         }
         result = Some(ScalarValue::try_from_array(batch.column(0), 0)?);
     }
@@ -424,7 +442,7 @@ mod tests {
 
     enum ExpectedSubqueryResult {
         Value(ScalarValue),
-        Error(&'static str),
+        TooManyRows,
     }
 
     #[derive(Debug)]
@@ -585,7 +603,25 @@ mod tests {
             (
                 "multiple_rows",
                 make_subquery_plan(vec![int32_batch(vec![1, 2, 3])]),
-                ExpectedSubqueryResult::Error("more than one row"),
+                ExpectedSubqueryResult::TooManyRows,
+            ),
+            (
+                "multiple_batches",
+                make_subquery_plan(vec![int32_batch(vec![1]), int32_batch(vec![2])]),
+                ExpectedSubqueryResult::TooManyRows,
+            ),
+            (
+                "multiple_partitions",
+                {
+                    let first = int32_batch(vec![1]);
+                    let schema = first.schema();
+                    TestMemoryExec::try_new_exec(
+                        &[vec![first], vec![int32_batch(vec![2])]],
+                        schema,
+                        None,
+                    )?
+                },
+                ExpectedSubqueryResult::TooManyRows,
             ),
         ] {
             let actual =
@@ -594,11 +630,15 @@ mod tests {
                 ExpectedSubqueryResult::Value(expected) => {
                     assert_eq!(actual?, expected, "{name}");
                 }
-                ExpectedSubqueryResult::Error(expected) => {
+                ExpectedSubqueryResult::TooManyRows => {
                     let err = actual.expect_err(name);
                     assert!(
-                        err.to_string().contains(expected),
-                        "{name}: expected error containing '{expected}', got {err}"
+                        matches!(
+                            err.find_root(),
+                            DataFusionError::External(inner)
+                                if inner.is::<ScalarSubqueryCardinalityError>()
+                        ),
+                        "{name}: expected typed cardinality violation, got {err}"
                     );
                 }
             }

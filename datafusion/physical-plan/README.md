@@ -28,6 +28,31 @@ Most projects should use the [`datafusion`] crate directly, which re-exports
 this module. If you are already using the [`datafusion`] crate, there is no
 reason to use this crate directly in your project as well.
 
+## LakeSoul 55.2.0 patch branch
+
+The `feature/lakesoul-physical-plan-55.2` branch is based on the upstream
+`55.2.0` tag (`500744d5c25499055e3b2ca46b022bc425989203`). It carries:
+
+- The spill-pool deadlock fix from apache/datafusion#24891
+  (`09a2aff72d88c16499ae3266a943a4cd9841b618`), including its regression tests.
+- `ScalarSubqueryCardinalityError`, returned for multi-row scalar subqueries so
+  LakeSoul's PostgreSQL wire layer can map them to SQLSTATE `21000` without
+  matching error text. Regression coverage includes multiple batches and
+  multiple partitions.
+
+This branch is intended for a single-crate `[patch.crates-io]` pinned to an
+immutable Git revision, not for replacing the whole DataFusion workspace.
+The crate manifest deliberately uses the published 55.2.0 registry dependency
+layout, rather than workspace/path dependencies, so the consuming application
+keeps one shared set of DataFusion types from crates.io.
+
+The source changes are identical to LakeSoul's former vendored patch.
+Keep the consuming application's lockfile when validating this branch; this
+patch migration does not require upgrading Arrow, Tokio, or other dependencies.
+The spill fix can be dropped once the consuming DataFusion release includes it.
+Retain the typed cardinality error until the protocol mapping has migrated to
+an equivalent upstream error classification.
+
 [apache arrow]: https://arrow.apache.org/
 [apache datafusion]: https://datafusion.apache.org/
 [`datafusion`]: https://crates.io/crates/datafusion
