@@ -3008,6 +3008,110 @@ fn except_with_duplicate_expressions() {
 }
 
 #[test]
+fn intersect_all_counts_duplicates() {
+    // The mock provider registers neither `count` nor `range`: INTERSECT ALL
+    // uses the built-in implementations directly.
+    let sql = "SELECT order_id, qty FROM orders \
+        INTERSECT ALL SELECT order_id, qty FROM orders";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: left.order_id, left.qty
+      Unnest: lists[__datafusion_set_operation_copies|depth=1] structs[]
+        Projection: left.order_id, left.qty, range(CASE WHEN __datafusion_set_operation_right_count < __datafusion_set_operation_left_count THEN __datafusion_set_operation_right_count ELSE __datafusion_set_operation_left_count END) AS __datafusion_set_operation_copies
+          Inner Join: left.order_id = right.order_id, left.qty = right.qty
+            Aggregate: groupBy=[[left.order_id, left.qty]], aggr=[[count(Int64(1)) AS __datafusion_set_operation_left_count]]
+              SubqueryAlias: left
+                Projection: orders.order_id, orders.qty
+                  TableScan: orders
+            Aggregate: groupBy=[[right.order_id, right.qty]], aggr=[[count(Int64(1)) AS __datafusion_set_operation_right_count]]
+              SubqueryAlias: right
+                Projection: orders.order_id, orders.qty
+                  TableScan: orders
+    "
+    );
+}
+
+#[test]
+fn except_all_counts_duplicates() {
+    let sql = "SELECT order_id FROM orders EXCEPT ALL SELECT id FROM person";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: orders.order_id
+      Unnest: lists[__datafusion_set_operation_copies|depth=1] structs[]
+        Projection: orders.order_id, range(CASE WHEN __datafusion_set_operation_right_count IS NULL THEN __datafusion_set_operation_left_count ELSE __datafusion_set_operation_left_count - __datafusion_set_operation_right_count END) AS __datafusion_set_operation_copies
+          Filter: __datafusion_set_operation_right_count IS NULL OR __datafusion_set_operation_left_count > __datafusion_set_operation_right_count
+            Left Join: orders.order_id = person.id
+              Aggregate: groupBy=[[orders.order_id]], aggr=[[count(Int64(1)) AS __datafusion_set_operation_left_count]]
+                Projection: orders.order_id
+                  TableScan: orders
+              Aggregate: groupBy=[[person.id]], aggr=[[count(Int64(1)) AS __datafusion_set_operation_right_count]]
+                Projection: person.id
+                  TableScan: person
+    "
+    );
+}
+
+#[test]
+fn intersect_all_casts_to_common_type() {
+    let sql = "SELECT CAST(order_id AS INT) AS x FROM orders \
+        INTERSECT ALL SELECT CAST(id AS BIGINT) FROM person";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: x
+      Unnest: lists[__datafusion_set_operation_copies|depth=1] structs[]
+        Projection: x, range(CASE WHEN __datafusion_set_operation_right_count < __datafusion_set_operation_left_count THEN __datafusion_set_operation_right_count ELSE __datafusion_set_operation_left_count END) AS __datafusion_set_operation_copies
+          Inner Join: x = person.id
+            Aggregate: groupBy=[[x]], aggr=[[count(Int64(1)) AS __datafusion_set_operation_left_count]]
+              Projection: CAST(x AS Int64) AS x
+                Projection: CAST(orders.order_id AS Int32) AS x
+                  TableScan: orders
+            Aggregate: groupBy=[[person.id]], aggr=[[count(Int64(1)) AS __datafusion_set_operation_right_count]]
+              Projection: CAST(person.id AS Int64)
+                TableScan: person
+    "
+    );
+}
+
+#[test]
+fn except_all_avoids_count_column_name_collision() {
+    let sql = "SELECT order_id AS __datafusion_set_operation_left_count FROM orders \
+        EXCEPT ALL SELECT id AS __datafusion_set_operation_right_count FROM person";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: __datafusion_set_operation_left_count
+      Unnest: lists[__datafusion_set_operation_copies|depth=1] structs[]
+        Projection: __datafusion_set_operation_left_count, range(CASE WHEN __datafusion_set_operation_right_count_1 IS NULL THEN __datafusion_set_operation_left_count_1 ELSE __datafusion_set_operation_left_count_1 - __datafusion_set_operation_right_count_1 END) AS __datafusion_set_operation_copies
+          Filter: __datafusion_set_operation_right_count_1 IS NULL OR __datafusion_set_operation_left_count_1 > __datafusion_set_operation_right_count_1
+            Left Join: __datafusion_set_operation_left_count = __datafusion_set_operation_right_count
+              Aggregate: groupBy=[[__datafusion_set_operation_left_count]], aggr=[[count(Int64(1)) AS __datafusion_set_operation_left_count_1]]
+                Projection: orders.order_id AS __datafusion_set_operation_left_count
+                  TableScan: orders
+              Aggregate: groupBy=[[__datafusion_set_operation_right_count]], aggr=[[count(Int64(1)) AS __datafusion_set_operation_right_count_1]]
+                Projection: person.id AS __datafusion_set_operation_right_count
+                  TableScan: person
+    "
+    );
+}
+
+#[test]
+fn intersect_all_rejects_incomparable_types() {
+    let sql = "SELECT order_id FROM orders INTERSECT ALL SELECT true";
+    let err = logical_plan(sql).unwrap_err();
+    assert_snapshot!(
+        err.strip_backtrace(),
+        @"Error during planning: INTERSECT ALL cannot compare column order_id of type UInt32 with column Boolean(true) of type Boolean"
+    );
+}
+
+#[test]
 fn empty_over() {
     let sql = "SELECT order_id, MAX(order_id) OVER () from orders";
     let plan = logical_plan(sql).unwrap();

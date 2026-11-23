@@ -32,6 +32,41 @@ crate directly in your project as well.
 [apache datafusion]: https://datafusion.apache.org/
 [`datafusion`]: https://crates.io/crates/datafusion
 
+## LakeSoul 55.2.0 patch branch
+
+The `feature/lakesoul-55.2` branch is stacked on the LakeSoul
+`datafusion-physical-plan` patch (`feature/lakesoul-physical-plan-55.2`), which
+is based on the upstream `55.2.0` tag
+(`500744d5c25499055e3b2ca46b022bc425989203`). One immutable revision of this
+branch therefore patches both `datafusion-physical-plan` and `datafusion-sql`.
+This crate carries:
+
+- Multiset `INTERSECT ALL` / `EXCEPT ALL` (lakesoul-io/LakeSoul#1320,
+  upstream apache/datafusion#12955 and apache/datafusion#12956). A row that
+  occurs `m` times on the left and `n` times on the right is returned
+  `min(m, n)` times by `INTERSECT ALL` and `max(m - n, 0)` times by
+  `EXCEPT ALL`, as in PostgreSQL. The planner casts both inputs to the common
+  column types, counts each distinct row per side, joins the counts with
+  `NULL`-safe equality and expands each row with `unnest(range(copies))`,
+  following apache/datafusion#25767. It uses the built-in `count` and `range`
+  implementations, so user functions with the same names cannot change the
+  result. Distinct `INTERSECT` / `EXCEPT` plans are unchanged.
+
+Only SQL planning changes: `LogicalPlanBuilder::intersect` / `except` (used
+by the DataFrame API and the Substrait consumer) keep the old membership
+semantics, and Substrait export of the new plans fails on `Unnest`.
+
+This branch is intended for single-crate `[patch.crates-io]` entries pinned to
+an immutable Git revision, not for replacing the whole DataFusion workspace.
+The crate manifest deliberately uses the published 55.2.0 registry dependency
+layout, rather than workspace/path dependencies, so the consuming application
+keeps one shared set of DataFusion types from crates.io. The only dependency
+added to the published manifest is `datafusion-functions-aggregate`, which is
+already part of every DataFusion dependency graph.
+
+The patch can be dropped once the consuming DataFusion release plans
+`INTERSECT ALL` / `EXCEPT ALL` with multiset semantics.
+
 ## Example Usage
 
 See the [examples] directory for fully working examples.

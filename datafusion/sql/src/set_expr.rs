@@ -15,13 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
+use arrow::datatypes::DataType;
 use datafusion_common::{
-    DataFusionError, Diagnostic, Result, Span, not_impl_err, plan_err,
+    Column, DataFusionError, Diagnostic, NullEquality, Result, Span, internal_err,
+    not_impl_err, plan_datafusion_err, plan_err,
 };
-use datafusion_expr::{LogicalPlan, LogicalPlanBuilder};
+use datafusion_expr::logical_plan::requalify_sides_if_needed;
+use datafusion_expr::type_coercion::binary::comparison_coercion;
+use datafusion_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder, cast, lit, when};
+use datafusion_functions_aggregate::count::count_udaf;
+use datafusion_functions_nested::range::range_udf;
 use sqlparser::ast::{SetExpr, SetOperator, SetQuantifier, Spanned};
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
@@ -161,14 +168,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             ) => LogicalPlanBuilder::from(left_plan)
                 .union_by_name_distinct(right_plan)?
                 .build(),
-            (SetOperator::Intersect, SetQuantifier::All) => {
-                LogicalPlanBuilder::intersect(left_plan, right_plan, true)
-            }
+            (SetOperator::Intersect, SetQuantifier::All) => plan_intersect_or_except_all(
+                left_plan,
+                right_plan,
+                SetOperator::Intersect,
+            ),
             (SetOperator::Intersect, SetQuantifier::Distinct | SetQuantifier::None) => {
                 LogicalPlanBuilder::intersect(left_plan, right_plan, false)
             }
             (SetOperator::Except, SetQuantifier::All) => {
-                LogicalPlanBuilder::except(left_plan, right_plan, true)
+                plan_intersect_or_except_all(left_plan, right_plan, SetOperator::Except)
             }
             (SetOperator::Except, SetQuantifier::Distinct | SetQuantifier::None) => {
                 LogicalPlanBuilder::except(left_plan, right_plan, false)
@@ -178,4 +187,181 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
         }
     }
+}
+
+/// Name of the per-row count of the left input in `INTERSECT ALL` / `EXCEPT ALL`
+/// plans. The names match apache/datafusion#25767.
+const SET_OPERATION_LEFT_COUNT: &str = "__datafusion_set_operation_left_count";
+/// Name of the per-row count of the right input.
+const SET_OPERATION_RIGHT_COUNT: &str = "__datafusion_set_operation_right_count";
+/// Name of the list of copy ordinals that is unnested to repeat each row.
+const SET_OPERATION_COPIES: &str = "__datafusion_set_operation_copies";
+
+/// Plans `INTERSECT ALL` / `EXCEPT ALL` with multiset semantics.
+///
+/// A row that occurs `m` times on the left and `n` times on the right is
+/// returned `min(m, n)` times by `INTERSECT ALL` and `max(m - n, 0)` times by
+/// `EXCEPT ALL` (SQL:1992, PostgreSQL). The plan:
+///
+/// 1. casts both inputs to the common comparison type of each column,
+/// 2. counts every distinct row of each input (`GROUP BY` all columns),
+/// 3. joins the counts with `NULL`-safe equality (inner join for
+///    `INTERSECT ALL`, left join for `EXCEPT ALL`),
+/// 4. computes the number of copies to keep, and
+/// 5. expands each row back into that many copies with `unnest(range(n))`.
+///
+/// Grouping (rather than numbering rows within partitions) compares values the
+/// same way `GROUP BY` and the join do, so `0.0` and `-0.0`, or values that
+/// are only equal after coercion, count as the same row.
+///
+/// `count` and `range` are the built-in implementations rather than functions
+/// resolved through the [`ContextProvider`], so user-registered functions with
+/// the same names cannot change the result.
+fn plan_intersect_or_except_all(
+    left_plan: LogicalPlan,
+    right_plan: LogicalPlan,
+    op: SetOperator,
+) -> Result<LogicalPlan> {
+    let left_len = left_plan.schema().fields().len();
+    let right_len = right_plan.schema().fields().len();
+    if left_len != right_len {
+        return plan_err!(
+            "INTERSECT/EXCEPT query must have the same number of columns. Left is {left_len} and right is {right_len}."
+        );
+    }
+
+    // Requalify sides if needed to avoid duplicate qualified field names
+    // (e.g., when both sides reference the same table)
+    let (left, right, _requalified) = requalify_sides_if_needed(
+        LogicalPlanBuilder::from(left_plan),
+        LogicalPlanBuilder::from(right_plan),
+    )?;
+
+    let common_types = left
+        .schema()
+        .iter()
+        .zip(right.schema().iter())
+        .map(|((_, left_field), (_, right_field))| {
+            let (left_type, right_type) = (left_field.data_type(), right_field.data_type());
+            if left_type == right_type {
+                return Ok(left_type.clone());
+            }
+            comparison_coercion(left_type, right_type).ok_or_else(|| {
+                plan_datafusion_err!(
+                    "{op} ALL cannot compare column {} of type {left_type} with column {} of type {right_type}",
+                    left_field.name(),
+                    right_field.name()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut used_names: HashSet<String> = left
+        .schema()
+        .fields()
+        .iter()
+        .chain(right.schema().fields().iter())
+        .map(|field| field.name().clone())
+        .collect();
+    let left_count = unique_name(SET_OPERATION_LEFT_COUNT, &mut used_names);
+    let right_count = unique_name(SET_OPERATION_RIGHT_COUNT, &mut used_names);
+    let copies = unique_name(SET_OPERATION_COPIES, &mut used_names);
+
+    let (left, left_columns) = count_distinct_rows(left, &common_types, &left_count)?;
+    let (right, right_columns) = count_distinct_rows(right, &common_types, &right_count)?;
+
+    let left_count = Expr::Column(Column::from_name(left_count));
+    let right_count = Expr::Column(Column::from_name(right_count));
+    let join_type = match op {
+        SetOperator::Intersect => JoinType::Inner,
+        SetOperator::Except => JoinType::Left,
+        _ => return internal_err!("{op} ALL is not planned with grouped counts"),
+    };
+    let joined = left.join_detailed(
+        right.build()?,
+        join_type,
+        (left_columns.clone(), right_columns),
+        None,
+        NullEquality::NullEqualsNull,
+    )?;
+
+    let (joined, copy_count) = match op {
+        // min(m, n); the inner join guarantees both counts are at least 1.
+        SetOperator::Intersect => (
+            joined,
+            when(right_count.clone().lt(left_count.clone()), right_count)
+                .otherwise(left_count)?,
+        ),
+        // max(m - n, 0); `n` is NULL when the row is absent on the right.
+        _ => (
+            joined.filter(
+                right_count
+                    .clone()
+                    .is_null()
+                    .or(left_count.clone().gt(right_count.clone())),
+            )?,
+            when(right_count.clone().is_null(), left_count.clone())
+                .otherwise(left_count - right_count)?,
+        ),
+    };
+
+    let output_columns = left_columns.into_iter().map(Expr::Column);
+    joined
+        .project(output_columns.clone().chain(std::iter::once(
+            range_udf().call(vec![copy_count]).alias(&copies),
+        )))?
+        .unnest_column(Column::from_name(copies))?
+        .project(output_columns)?
+        .build()
+}
+
+/// Casts the columns of `input` to `types` (keeping their qualified names) and
+/// counts how often each distinct row occurs, as a column named `count_name`.
+///
+/// Returns the plan and its grouping columns.
+fn count_distinct_rows(
+    input: LogicalPlanBuilder,
+    types: &[DataType],
+    count_name: &str,
+) -> Result<(LogicalPlanBuilder, Vec<Column>)> {
+    let schema = Arc::clone(input.schema());
+    let needs_cast = schema
+        .fields()
+        .iter()
+        .zip(types)
+        .any(|(field, data_type)| field.data_type() != data_type);
+    let input = if needs_cast {
+        input.project(schema.iter().zip(types).map(
+            |((qualifier, field), data_type)| {
+                let column = Expr::Column(Column::new(qualifier.cloned(), field.name()));
+                if field.data_type() == data_type {
+                    column
+                } else {
+                    cast(column, data_type.clone())
+                        .alias_qualified(qualifier.cloned(), field.name())
+                }
+            },
+        ))?
+    } else {
+        input
+    };
+    let group_by = input.schema().columns();
+    let counted = input.aggregate(
+        group_by.iter().cloned().map(Expr::Column),
+        vec![count_udaf().call(vec![lit(1_i64)]).alias(count_name)],
+    )?;
+    Ok((counted, group_by))
+}
+
+/// Returns `base`, or `base` with the first numeric suffix that is not in
+/// `used`, and records the result in `used`.
+fn unique_name(base: &str, used: &mut HashSet<String>) -> String {
+    let mut name = base.to_string();
+    let mut suffix = 1;
+    while used.contains(&name) {
+        name = format!("{base}_{suffix}");
+        suffix += 1;
+    }
+    used.insert(name.clone());
+    name
 }

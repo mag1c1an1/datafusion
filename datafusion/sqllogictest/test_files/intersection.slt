@@ -42,3 +42,251 @@ query IR
 SELECT int_col, double_col FROM alltypes_plain where int_col > 0 INTERSECT SELECT int_col, double_col FROM alltypes_plain
 ----
 1 10.1
+
+#####
+## INTERSECT ALL / EXCEPT ALL multiset semantics
+## A row with m copies on the left and n on the right is returned
+## min(m, n) times by INTERSECT ALL and max(m - n, 0) times by EXCEPT ALL.
+#####
+
+statement ok
+CREATE TABLE set_ops_l(x INT) AS VALUES (1), (1), (1), (1), (2), (4), (NULL), (NULL), (NULL), (NULL);
+
+statement ok
+CREATE TABLE set_ops_r(x INT) AS VALUES (1), (1), (2), (2), (3), (NULL), (NULL);
+
+query I
+SELECT x FROM set_ops_l INTERSECT ALL SELECT x FROM set_ops_r ORDER BY x NULLS LAST;
+----
+1
+1
+2
+NULL
+NULL
+
+query I
+SELECT x FROM set_ops_l EXCEPT ALL SELECT x FROM set_ops_r ORDER BY x NULLS LAST;
+----
+1
+1
+4
+NULL
+NULL
+
+query I
+SELECT x FROM set_ops_r EXCEPT ALL SELECT x FROM set_ops_l ORDER BY x NULLS LAST;
+----
+2
+3
+
+# The issue reproducers, with CTEs over VALUES.
+query I
+WITH l(x) AS (VALUES (1), (1), (1), (1), (2), (4), (NULL), (NULL), (NULL), (NULL)),
+     r(x) AS (VALUES (1), (1), (2), (2), (3), (NULL), (NULL))
+SELECT x FROM l INTERSECT ALL SELECT x FROM r ORDER BY x NULLS LAST;
+----
+1
+1
+2
+NULL
+NULL
+
+query I
+WITH l(x) AS (VALUES (1), (1), (1), (1), (2), (4), (NULL), (NULL), (NULL), (NULL)),
+     r(x) AS (VALUES (1), (1), (2), (2), (3), (NULL), (NULL))
+SELECT x FROM l EXCEPT ALL SELECT x FROM r ORDER BY x NULLS LAST;
+----
+1
+1
+4
+NULL
+NULL
+
+# Distinct INTERSECT / EXCEPT are unaffected.
+query I
+SELECT x FROM set_ops_l INTERSECT SELECT x FROM set_ops_r ORDER BY x NULLS LAST;
+----
+1
+2
+NULL
+
+query I
+SELECT x FROM set_ops_l EXCEPT SELECT x FROM set_ops_r ORDER BY x NULLS LAST;
+----
+4
+
+# Same input on both sides.
+query I
+SELECT x FROM set_ops_l INTERSECT ALL SELECT x FROM set_ops_l ORDER BY x NULLS LAST;
+----
+1
+1
+1
+1
+2
+4
+NULL
+NULL
+NULL
+NULL
+
+query I
+SELECT count(*) FROM (SELECT x FROM set_ops_l EXCEPT ALL SELECT x FROM set_ops_l);
+----
+0
+
+# Empty right side keeps (EXCEPT ALL) or drops (INTERSECT ALL) every copy.
+query I
+SELECT count(*) FROM (SELECT x FROM set_ops_l EXCEPT ALL SELECT x FROM set_ops_r WHERE false);
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT x FROM set_ops_l INTERSECT ALL SELECT x FROM set_ops_r WHERE false);
+----
+0
+
+# Multi-column rows, including NULLs in some columns.
+statement ok
+CREATE TABLE set_ops_l2(a INT, b VARCHAR) AS VALUES
+  (1, 'x'), (1, 'x'), (1, 'x'), (1, 'y'), (1, NULL), (1, NULL), (NULL, 'x'), (2, 'z');
+
+statement ok
+CREATE TABLE set_ops_r2(a INT, b VARCHAR) AS VALUES
+  (1, 'x'), (1, 'x'), (1, 'z'), (1, NULL), (NULL, 'x'), (NULL, 'x'), (2, 'y');
+
+query IT
+SELECT a, b FROM set_ops_l2 INTERSECT ALL SELECT a, b FROM set_ops_r2 ORDER BY a NULLS LAST, b NULLS LAST;
+----
+1 x
+1 x
+1 NULL
+NULL x
+
+query IT
+SELECT a, b FROM set_ops_l2 EXCEPT ALL SELECT a, b FROM set_ops_r2 ORDER BY a NULLS LAST, b NULLS LAST;
+----
+1 x
+1 y
+1 NULL
+2 z
+
+# Nested set operations.
+query I
+(SELECT x FROM set_ops_l INTERSECT ALL SELECT x FROM set_ops_r)
+EXCEPT ALL
+SELECT x FROM (VALUES (1), (NULL)) t(x)
+ORDER BY x NULLS LAST;
+----
+1
+2
+NULL
+
+query I
+SELECT x FROM set_ops_l
+EXCEPT ALL
+(SELECT x FROM set_ops_r INTERSECT ALL SELECT x FROM (VALUES (1), (1), (1), (NULL)) t(x))
+ORDER BY x NULLS LAST;
+----
+1
+1
+2
+4
+NULL
+NULL
+NULL
+
+# (l INTERSECT ALL r) UNION ALL (l EXCEPT ALL r) is l.
+query I
+(SELECT x FROM set_ops_l INTERSECT ALL SELECT x FROM set_ops_r)
+UNION ALL
+(SELECT x FROM set_ops_l EXCEPT ALL SELECT x FROM set_ops_r)
+ORDER BY x NULLS LAST;
+----
+1
+1
+1
+1
+2
+4
+NULL
+NULL
+NULL
+NULL
+
+query I
+SELECT count(*) FROM (SELECT x FROM set_ops_l INTERSECT ALL SELECT x FROM set_ops_r) t WHERE x = 1;
+----
+2
+
+# +0.0 and -0.0 are the same row, so each side counts them together.
+query I
+SELECT count(*) FROM (
+  SELECT a FROM (VALUES (0.0), (-0.0)) t(a) INTERSECT ALL SELECT a FROM (VALUES (0.0)) s(a)
+);
+----
+1
+
+query I
+SELECT count(*) FROM (
+  SELECT a FROM (VALUES (0.0), (-0.0)) t(a) EXCEPT ALL SELECT a FROM (VALUES (0.0)) s(a)
+);
+----
+1
+
+query I
+SELECT count(*) FROM (
+  SELECT a FROM (VALUES (0.0), (-0.0), (0.0)) t(a) EXCEPT ALL SELECT a FROM (VALUES (-0.0), (0.0)) s(a)
+);
+----
+1
+
+# Columns are compared, and returned, as their common type.
+query IT
+SELECT x, arrow_typeof(x) FROM (
+  SELECT arrow_cast(x, 'Int32') AS x FROM set_ops_l
+  INTERSECT ALL
+  SELECT arrow_cast(x, 'Int64') FROM set_ops_r
+) ORDER BY x NULLS LAST;
+----
+1 Int64
+1 Int64
+2 Int64
+NULL Int64
+NULL Int64
+
+# User joins with IS NOT DISTINCT FROM keep membership semantics.
+query I
+SELECT l.x FROM set_ops_l l LEFT SEMI JOIN set_ops_r r ON l.x IS NOT DISTINCT FROM r.x ORDER BY l.x NULLS LAST;
+----
+1
+1
+1
+1
+2
+NULL
+NULL
+NULL
+NULL
+
+query I
+SELECT l.x FROM set_ops_l l LEFT ANTI JOIN set_ops_r r ON l.x IS NOT DISTINCT FROM r.x ORDER BY l.x NULLS LAST;
+----
+4
+
+query I
+SELECT r.x FROM set_ops_r r LEFT ANTI JOIN set_ops_l l ON l.x IS NOT DISTINCT FROM r.x ORDER BY r.x NULLS LAST;
+----
+3
+
+statement ok
+DROP TABLE set_ops_l;
+
+statement ok
+DROP TABLE set_ops_r;
+
+statement ok
+DROP TABLE set_ops_l2;
+
+statement ok
+DROP TABLE set_ops_r2;
